@@ -28,10 +28,11 @@ Rule order matters. The default pipeline may change between releases.
 
 ### Analyzer Rules
 
-| order | rule                        | summary                                                                                 |
-| ----- | --------------------------- | --------------------------------------------------------------------------------------- |
-| 1     | `resolve_grouping_function` | Rewrites `GROUPING(...)` calls into expressions over DataFusion's internal grouping id. |
-| 2     | `type_coercion`             | Adds implicit casts so operators and functions receive valid input types.               |
+| order | rule                        | summary                                                                                     |
+| ----- | --------------------------- | ------------------------------------------------------------------------------------------- |
+| 1     | `resolve_grouping_function` | Rewrites `GROUPING(...)` calls into expressions over DataFusion's internal grouping id.     |
+| 2     | `type_coercion`             | Adds implicit casts so operators and functions receive valid input types.                   |
+| 3     | `case_dictionary_encoding`  | When enabled, rewrites literal-branch CASE expressions in projections to emit dictionaries. |
 
 ### Logical Optimizer Rules
 

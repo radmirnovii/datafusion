@@ -28,12 +28,14 @@ use datafusion_common::instant::Instant;
 use datafusion_expr::expr_rewriter::FunctionRewrite;
 use datafusion_expr::{InvariantLevel, LogicalPlan};
 
+use crate::analyzer::case_dictionary::CaseDictionaryEncoding;
 use crate::analyzer::resolve_grouping_function::ResolveGroupingFunction;
 use crate::analyzer::type_coercion::TypeCoercion;
 use crate::utils::log_plan;
 
 use self::function_rewrite::ApplyFunctionRewrites;
 
+pub mod case_dictionary;
 pub mod function_rewrite;
 pub mod resolve_grouping_function;
 pub mod type_coercion;
@@ -88,6 +90,9 @@ impl Analyzer {
         let rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>> = vec![
             Arc::new(ResolveGroupingFunction::new()),
             Arc::new(TypeCoercion::new()),
+            // Runs after TypeCoercion: rewrites literal-branch CASE to
+            // dictionary output when enabled, then re-coerces its consumers.
+            Arc::new(CaseDictionaryEncoding::new()),
         ];
         Self::with_rules(rules)
     }

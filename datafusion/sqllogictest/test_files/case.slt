@@ -906,3 +906,196 @@ drop table floats;
 #####
 # End of lookup table CASE tests
 #####
+
+#####
+# Dictionary output for literal-branch CASE
+# (datafusion.optimizer.emit_dictionary_for_literal_case)
+#####
+
+statement ok
+create table case_dict_t(c int, s varchar) as values (0, 'a'), (1, 'b'), (2, 'c'), (NULL, 'd');
+
+# The flag is off by default: flat output type
+query T
+SELECT arrow_typeof(CASE c WHEN 0 THEN 'fizz' WHEN 1 THEN 'buzz' ELSE 'other' END) FROM case_dict_t LIMIT 1;
+----
+Utf8
+
+statement ok
+set datafusion.optimizer.emit_dictionary_for_literal_case = true;
+
+# Lookup-table form: the projected column reports the dictionary type
+query T
+SELECT arrow_typeof(CASE c WHEN 0 THEN 'fizz' WHEN 1 THEN 'buzz' ELSE 'other' END) FROM case_dict_t LIMIT 1;
+----
+Dictionary(UInt32, Utf8)
+
+# Values match the flat run; a NULL base takes the ELSE branch
+query IT
+SELECT c, CASE c WHEN 0 THEN 'fizz' WHEN 1 THEN 'buzz' ELSE 'other' END FROM case_dict_t ORDER BY c NULLS LAST;
+----
+0 fizz
+1 buzz
+2 other
+NULL other
+
+# Condition form (no base expression); NULL conditions count as false
+query T
+SELECT CASE WHEN c = 0 THEN 'zero' WHEN c = 1 THEN 'one' ELSE 'many' END FROM case_dict_t ORDER BY c NULLS LAST;
+----
+zero
+one
+many
+many
+
+# Missing ELSE yields nulls through the dictionary as well (two WHENs: the
+# general builder path)
+query T
+SELECT CASE WHEN c = 0 THEN 'zero' WHEN c = 1 THEN 'one' END FROM case_dict_t ORDER BY c NULLS LAST;
+----
+zero
+one
+NULL
+NULL
+
+# A single WHEN without ELSE is served by a plain cast today (the fused
+# expression does not cover that shape yet); the type is still dictionary
+query TT
+SELECT arrow_typeof(CASE WHEN c = 0 THEN 'zero' END), CASE WHEN c = 0 THEN 'zero' END FROM case_dict_t ORDER BY c NULLS LAST LIMIT 1;
+----
+Dictionary(UInt32, Utf8) zero
+
+# Conditions stay lazy: the second branch divides by c, which is only safe
+# because the first branch has already claimed the zero row
+query T
+SELECT CASE WHEN c = 0 THEN 'zero' WHEN 100 / c > 60 THEN 'big' ELSE 'small' END
+FROM case_dict_t WHERE c IS NOT NULL ORDER BY c;
+----
+zero
+big
+small
+
+# Aggregation over the produced dictionary column
+query TI
+SELECT label, count(*) FROM
+  (SELECT CASE c WHEN 0 THEN 'fizz' ELSE 'other' END AS label FROM case_dict_t)
+GROUP BY label ORDER BY label;
+----
+fizz 1
+other 3
+
+# Non-literal branches keep the flat type
+query T
+SELECT arrow_typeof(CASE WHEN c = 0 THEN s ELSE 'x' END) FROM case_dict_t LIMIT 1;
+----
+Utf8View
+
+# Interval outputs stay flat: arrow cannot pack intervals into dictionaries,
+# so the rewrite leaves them alone
+query T
+SELECT arrow_typeof(CASE WHEN c = 0 THEN INTERVAL '1 day' END) FROM case_dict_t LIMIT 1;
+----
+Interval(MonthDayNano)
+
+# A function over the produced dictionary: values match the flat run and the
+# encoding is preserved through the call
+query T
+SELECT reverse(CASE c WHEN 0 THEN 'fizz' WHEN 1 THEN 'buzz' ELSE 'other' END) FROM case_dict_t ORDER BY c NULLS LAST;
+----
+zzif
+zzub
+rehto
+rehto
+
+query T
+SELECT arrow_typeof(reverse(CASE c WHEN 0 THEN 'fizz' ELSE 'other' END)) FROM case_dict_t LIMIT 1;
+----
+Dictionary(UInt32, Utf8)
+
+# Downstream consumers of the produced dictionary column
+query T
+SELECT label FROM
+  (SELECT CASE c WHEN 0 THEN 'fizz' WHEN 1 THEN 'buzz' ELSE 'other' END AS label FROM case_dict_t)
+ORDER BY label DESC LIMIT 2;
+----
+other
+other
+
+query T
+SELECT DISTINCT label FROM
+  (SELECT CASE c WHEN 0 THEN 'fizz' WHEN 1 THEN 'buzz' ELSE 'other' END AS label FROM case_dict_t)
+ORDER BY label;
+----
+buzz
+fizz
+other
+
+query TT
+SELECT min(label), max(label) FROM
+  (SELECT CASE c WHEN 0 THEN 'fizz' WHEN 1 THEN 'buzz' ELSE 'other' END AS label FROM case_dict_t);
+----
+buzz other
+
+query TI
+SELECT j.k, count(*) FROM
+  (SELECT CASE c WHEN 0 THEN 'fizz' ELSE 'other' END AS label FROM case_dict_t) l
+  JOIN (VALUES ('fizz'), ('other')) j(k) ON l.label = j.k
+GROUP BY j.k ORDER BY j.k;
+----
+fizz 1
+other 3
+
+query I
+SELECT max(rn) FROM
+  (SELECT row_number() OVER (PARTITION BY label) AS rn FROM
+    (SELECT CASE c WHEN 0 THEN 'fizz' ELSE 'other' END AS label FROM case_dict_t));
+----
+3
+
+query TII
+SELECT label, c % 2, count(*) FROM
+  (SELECT c, CASE c WHEN 0 THEN 'fizz' ELSE 'other' END AS label FROM case_dict_t)
+GROUP BY label, c % 2 ORDER BY label, c % 2;
+----
+fizz 0 1
+other 0 1
+other 1 1
+other NULL 1
+
+# Recursive CTEs are left alone: the work table's schema is frozen before
+# the analyzer runs, so the static term must keep its flat type
+query IT
+WITH RECURSIVE r(n, lbl) AS (
+  SELECT 1, CASE WHEN 1 = 1 THEN 'a' ELSE 'b' END
+  UNION ALL
+  SELECT n + 1, lbl FROM r WHERE n < 3
+)
+SELECT n, lbl FROM r ORDER BY n;
+----
+1 a
+2 a
+3 a
+
+# INSERT targets keep their declared column types: the write path must not
+# receive dictionary batches under a flat-typed table schema
+statement ok
+create table case_dict_sink(label varchar);
+
+query I
+INSERT INTO case_dict_sink SELECT CASE c WHEN 0 THEN 'fizz' ELSE 'other' END FROM case_dict_t;
+----
+4
+
+query TT
+SELECT arrow_typeof(label), label FROM case_dict_sink ORDER BY label LIMIT 1;
+----
+Utf8View fizz
+
+statement ok
+drop table case_dict_sink;
+
+statement ok
+set datafusion.optimizer.emit_dictionary_for_literal_case = false;
+
+statement ok
+drop table case_dict_t;

@@ -175,6 +175,7 @@ initial_logical_plan
 02)--TableScan: simple_explain_test
 logical_plan after resolve_grouping_function SAME TEXT AS ABOVE
 logical_plan after type_coercion SAME TEXT AS ABOVE
+logical_plan after case_dictionary_encoding SAME TEXT AS ABOVE
 analyzed_logical_plan SAME TEXT AS ABOVE
 logical_plan after rewrite_set_comparison SAME TEXT AS ABOVE
 logical_plan after optimize_unions SAME TEXT AS ABOVE
@@ -554,6 +555,7 @@ initial_logical_plan
 02)--TableScan: simple_explain_test
 logical_plan after resolve_grouping_function SAME TEXT AS ABOVE
 logical_plan after type_coercion SAME TEXT AS ABOVE
+logical_plan after case_dictionary_encoding SAME TEXT AS ABOVE
 analyzed_logical_plan SAME TEXT AS ABOVE
 logical_plan after rewrite_set_comparison SAME TEXT AS ABOVE
 logical_plan after optimize_unions SAME TEXT AS ABOVE

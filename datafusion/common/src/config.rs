@@ -1738,6 +1738,16 @@ config_namespace! {
         /// Coerces `Utf8View` to `LargeUtf8`, and `BinaryView` to `LargeBinary`.
         pub expand_views_at_output: bool, default = false
 
+        /// When set to true, `CASE` expressions in projections whose THEN and
+        /// ELSE branches are all literals emit `Dictionary(UInt32, T)` instead
+        /// of a flat array: the branch literals become the dictionary values
+        /// and the per-row branch choice the keys. Downstream expressions that
+        /// understand dictionaries then work per distinct value instead of per
+        /// row. Changes the Arrow data type such columns report. Physical
+        /// plans containing the rewritten expression cannot be serialized
+        /// to protobuf yet.
+        pub emit_dictionary_for_literal_case: bool, default = false
+
         /// Enable sort pushdown optimization.
         /// When enabled, attempts to push sort requirements down to data sources
         /// that can natively handle them (e.g., by reversing file/row group read order).

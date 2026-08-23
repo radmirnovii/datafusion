@@ -24,7 +24,7 @@ use crate::{
     expressions::{self, Column, Literal, binary, like, similar_to},
 };
 
-use arrow::datatypes::Schema;
+use arrow::datatypes::{DataType, Schema};
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::datatype::FieldExt;
 use datafusion_common::metadata::{FieldMetadata, format_type_and_metadata};
@@ -384,12 +384,43 @@ pub fn create_physical_expr(
                 };
             Ok(expressions::case(expr, when_then_expr, else_expr)?)
         }
-        Expr::Cast(Cast { expr, field }) => expressions::cast_with_target_field(
-            create_physical_expr(expr, input_dfschema, execution_props, planning_ctx)?,
-            input_schema,
-            Arc::clone(field),
-            None,
-        ),
+        Expr::Cast(Cast { expr, field }) => {
+            let physical_expr = create_physical_expr(
+                expr,
+                input_dfschema,
+                execution_props,
+                planning_ctx,
+            )?;
+            // A literal-branch CASE cast to `Dictionary(UInt32, T)` emits the
+            // dictionary directly (branch literals as values, branch choice
+            // as keys) instead of casting the flat result row by row. Other
+            // shapes fall through to the regular cast. Gated on the config
+            // flag so plans that never opted in (for example a hand-written
+            // arrow_cast) keep their previous physical form.
+            if execution_props
+                .config_options
+                .as_ref()
+                .is_some_and(|config| config.optimizer.emit_dictionary_for_literal_case)
+                && matches!(field.data_type(), DataType::Dictionary(key, _) if key.as_ref() == &DataType::UInt32)
+                && field.metadata().is_empty()
+                && let Some(case) = physical_expr.downcast_ref::<expressions::CaseExpr>()
+                && let Ok(fused) = expressions::CaseExpr::try_new(
+                    case.expr().cloned(),
+                    case.when_then_expr().to_vec(),
+                    case.else_expr().cloned(),
+                )
+                .and_then(|rebuilt| rebuilt.try_with_dictionary_output())
+                && &fused.data_type(input_schema)? == field.data_type()
+            {
+                return Ok(Arc::new(fused));
+            }
+            expressions::cast_with_target_field(
+                physical_expr,
+                input_schema,
+                Arc::clone(field),
+                None,
+            )
+        }
         Expr::TryCast(TryCast { expr, field }) => {
             if !field.metadata().is_empty() {
                 let (_, src_field) = expr.to_field(input_dfschema)?;

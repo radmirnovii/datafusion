@@ -16,13 +16,15 @@
 // under the License.
 
 use arrow::array::{Array, ArrayRef, Int32Array, Int32Builder, StringArray};
-use arrow::datatypes::{ArrowNativeTypeOp, Field, Schema};
+use arrow::datatypes::{ArrowNativeTypeOp, DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use arrow::util::test_util::seedable_rng;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use datafusion_common::ScalarValue;
 use datafusion_expr::Operator;
-use datafusion_physical_expr::expressions::{BinaryExpr, case, col, lit};
+use datafusion_physical_expr::expressions::{
+    BinaryExpr, CaseExpr, CastExpr, case, col, lit,
+};
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use itertools::Itertools;
 use rand::distr::Alphanumeric;
@@ -95,6 +97,7 @@ fn criterion_benchmark(c: &mut Criterion) {
 
     benchmark_lookup_table_case_when(c, 8192);
     benchmark_divide_by_zero_protection(c, 8192);
+    benchmark_dictionary_output(c);
 }
 
 fn run_benchmarks(c: &mut Criterion, batch: &RecordBatch) {
@@ -594,6 +597,82 @@ fn benchmark_divide_by_zero_protection(c: &mut Criterion, batch_size: usize) {
         );
     }
 
+    group.finish();
+}
+
+fn benchmark_dictionary_output(c: &mut Criterion) {
+    // Flat/dictionary pairs over one batch: with dictionary output the branch
+    // literals become the values array and the per-row branch choice the keys.
+    let mut group = c.benchmark_group("dictionary_output_case_when");
+
+    let schema = Schema::new(vec![Field::new("c", DataType::Int32, false)]);
+    let keys: Int32Array = (0..8192).map(|i| Some(i % 3)).collect();
+    let batch =
+        RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(keys) as ArrayRef])
+            .unwrap();
+
+    let condition = |value: i32| -> Arc<dyn PhysicalExpr> {
+        Arc::new(BinaryExpr::new(
+            col("c", &schema).unwrap(),
+            Operator::Eq,
+            lit(value),
+        ))
+    };
+    // CASE c WHEN 0 THEN .. WHEN 1 THEN .. ELSE .. END: the lookup table path
+    let lookup_case = || {
+        CaseExpr::try_new(
+            Some(col("c", &schema).unwrap()),
+            vec![(lit(0), lit("fizz")), (lit(1), lit("buzz"))],
+            Some(lit("other")),
+        )
+        .unwrap()
+    };
+    // CASE WHEN c = 0 THEN .. WHEN c = 1 THEN .. ELSE .. END: the ResultBuilder path
+    let condition_case = || {
+        CaseExpr::try_new(
+            None,
+            vec![(condition(0), lit("fizz")), (condition(1), lit("buzz"))],
+            Some(lit("other")),
+        )
+        .unwrap()
+    };
+    // CASE WHEN c = 0 THEN .. ELSE .. END: the ScalarOrScalar path
+    let if_case = || {
+        CaseExpr::try_new(None, vec![(condition(0), lit("fizz"))], Some(lit("other")))
+            .unwrap()
+    };
+
+    let cases: Vec<(&str, Arc<dyn PhysicalExpr>)> = vec![
+        ("lookup flat", Arc::new(lookup_case())),
+        (
+            "lookup dictionary",
+            Arc::new(lookup_case().try_with_dictionary_output().unwrap()),
+        ),
+        ("condition flat", Arc::new(condition_case())),
+        (
+            "condition dictionary",
+            Arc::new(condition_case().try_with_dictionary_output().unwrap()),
+        ),
+        ("if flat", Arc::new(if_case())),
+        (
+            "if dictionary",
+            Arc::new(if_case().try_with_dictionary_output().unwrap()),
+        ),
+        (
+            // An encoding-unaware consumer pays one cast back to flat.
+            "lookup dictionary + cast back",
+            Arc::new(CastExpr::new(
+                Arc::new(lookup_case().try_with_dictionary_output().unwrap()),
+                DataType::Utf8,
+                None,
+            )),
+        ),
+    ];
+    for (name, expr) in cases {
+        group.bench_function(name, |b| {
+            b.iter(|| black_box(expr.evaluate(black_box(&batch)).unwrap()))
+        });
+    }
     group.finish();
 }
 

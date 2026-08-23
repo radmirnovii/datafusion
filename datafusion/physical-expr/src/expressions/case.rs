@@ -32,7 +32,7 @@ use arrow::error::ArrowError;
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::{
     DataFusionError, Result, ScalarValue, assert_or_internal_err, exec_err,
-    internal_datafusion_err, internal_err,
+    internal_datafusion_err, internal_err, plan_err,
 };
 use datafusion_expr::ColumnarValue;
 use indexmap::IndexMap;
@@ -276,13 +276,19 @@ pub struct CaseExpr {
     body: CaseBody,
     /// Evaluation method to use
     eval_method: EvalMethod,
+    /// When set, emit `Dictionary(UInt32, T)` instead of flat `T`. Holds the
+    /// branch literals as the values array shared by every batch, so
+    /// downstream consumers can recognize repeated values buffers.
+    dictionary_values: Option<ArrayRef>,
 }
 
 // eval_method is functionally derived from body, so excluding it from
 // Hash/Eq avoids redundantly hashing the expression tree twice. For
 // nested CASE chains this prevents exponential blowup (see #22173).
+// dictionary_values is derived from body as well; only its presence matters.
 impl Hash for CaseExpr {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.dictionary_values.is_some().hash(state);
         self.body.hash(state);
     }
 }
@@ -290,6 +296,7 @@ impl Hash for CaseExpr {
 impl PartialEq for CaseExpr {
     fn eq(&self, other: &Self) -> bool {
         self.body == other.body
+            && self.dictionary_values.is_some() == other.dictionary_values.is_some()
     }
 }
 
@@ -395,10 +402,6 @@ impl PartialResultIndex {
         Self { index: NONE_VALUE }
     }
 
-    fn zero() -> Self {
-        Self { index: 0 }
-    }
-
     /// Creates a new partial result index.
     ///
     /// If the provided value is greater than or equal to `u32::MAX`
@@ -473,17 +476,29 @@ struct ResultBuilder {
     /// The number of rows in the final result.
     row_count: usize,
     state: ResultState,
+    /// Emit `Dictionary(UInt32, data_type)`: the prebuilt branch literals are
+    /// the values shared by every batch, branch ordinals index into them, and
+    /// the row-to-branch mapping becomes the keys.
+    dictionary_values: Option<ArrayRef>,
 }
 
 impl ResultBuilder {
     /// Creates a new ResultBuilder that will produce arrays of the given data type.
     ///
     /// The `row_count` parameter indicates the number of rows in the final result.
-    fn new(data_type: &DataType, row_count: usize) -> Self {
+    /// With `dictionary_values`, the builder emits `Dictionary(UInt32, values)`
+    /// instead: callers must only add scalar branch results, and values slot
+    /// `n` must hold the value branch `n` produces.
+    fn new(
+        data_type: &DataType,
+        row_count: usize,
+        dictionary_values: Option<ArrayRef>,
+    ) -> Self {
         Self {
             data_type: data_type.clone(),
             row_count,
             state: ResultState::Empty,
+            dictionary_values,
         }
     }
 
@@ -519,14 +534,21 @@ impl ResultBuilder {
     /// row indices        partial     partial                                 partial     partial
     ///                    indices     arrays                                  indices     arrays
     /// ```
+    /// `branch_index` is the ordinal of the branch that produced this result,
+    /// counting the ELSE branch as one past the last WHEN. In dictionary mode
+    /// it addresses the prebuilt value slot the rows take; flat mode does not
+    /// use it.
     fn add_branch_result(
         &mut self,
         row_indices: &ArrayRef,
         value: ColumnarValue,
+        branch_index: usize,
     ) -> Result<()> {
         match value {
             ColumnarValue::Array(a) => {
-                if a.len() != row_indices.len() {
+                if self.dictionary_values.is_some() {
+                    internal_err!("dictionary CASE output requires scalar branches")
+                } else if a.len() != row_indices.len() {
                     internal_err!("Array length must match row indices length")
                 } else if row_indices.len() == self.row_count {
                     self.set_complete_result(ColumnarValue::Array(a))
@@ -536,7 +558,22 @@ impl ResultBuilder {
             }
             ColumnarValue::Scalar(s) => {
                 if row_indices.len() == self.row_count {
-                    self.set_complete_result(ColumnarValue::Scalar(s))
+                    if let Some(values) = &self.dictionary_values {
+                        // Answer from the prebuilt slot, not the raw scalar:
+                        // the slot carries the declared value type even when
+                        // a hand-built expression mixes branch literal types.
+                        let slot = ScalarValue::try_from_array(values, branch_index)?;
+                        self.set_complete_result(ColumnarValue::Scalar(slot))
+                    } else {
+                        self.set_complete_result(ColumnarValue::Scalar(s))
+                    }
+                } else if self.dictionary_values.is_some() {
+                    // The value already sits in the prebuilt slot; only the
+                    // row-to-branch mapping needs recording.
+                    self.mark_rows(
+                        row_indices,
+                        PartialResultIndex::try_new(branch_index)?,
+                    )
                 } else {
                     self.add_partial_result(
                         row_indices,
@@ -545,6 +582,36 @@ impl ResultBuilder {
                 }
             }
         }
+    }
+
+    /// Marks `row_indices` as taking their values from partial result `index`,
+    /// transitioning to the Partial state on first use. In dictionary mode the
+    /// index is a slot in the prebuilt values and no partial arrays exist.
+    fn mark_rows(
+        &mut self,
+        row_indices: &ArrayRef,
+        index: PartialResultIndex,
+    ) -> Result<()> {
+        assert_or_internal_err!(
+            row_indices.null_count() == 0,
+            "Row indices must not contain nulls"
+        );
+
+        let (_, indices) = self.partial_state()?;
+        for row_ix in row_indices.as_primitive::<UInt32Type>().values().iter() {
+            // This check is only active for debug config because the callers,
+            // `case_when_with_expr` and `case_when_no_expr`, already ensure that
+            // they only calculate a value for each row at most once.
+            #[cfg(debug_assertions)]
+            assert_or_internal_err!(
+                indices[*row_ix as usize].is_none(),
+                "Duplicate value for row {}",
+                *row_ix
+            );
+
+            indices[*row_ix as usize] = index;
+        }
+        Ok(())
     }
 
     /// Adds a partial result array.
@@ -557,47 +624,29 @@ impl ResultBuilder {
         row_indices: &ArrayRef,
         row_values: ArrayRef,
     ) -> Result<()> {
-        assert_or_internal_err!(
-            row_indices.null_count() == 0,
-            "Row indices must not contain nulls"
-        );
+        let index = {
+            let (arrays, _) = self.partial_state()?;
+            let index = PartialResultIndex::try_new(arrays.len())?;
+            arrays.push(row_values);
+            index
+        };
+        self.mark_rows(row_indices, index)
+    }
 
+    /// The partial arrays and index mapping, transitioning Empty to an empty
+    /// Partial state first; errors when a complete result is already set.
+    fn partial_state(
+        &mut self,
+    ) -> Result<(&mut Vec<ArrayRef>, &mut Vec<PartialResultIndex>)> {
+        if matches!(self.state, ResultState::Empty) {
+            self.state = ResultState::Partial {
+                arrays: vec![],
+                indices: vec![PartialResultIndex::none(); self.row_count],
+            };
+        }
         match &mut self.state {
-            ResultState::Empty => {
-                let array_index = PartialResultIndex::zero();
-                let mut indices = vec![PartialResultIndex::none(); self.row_count];
-                for row_ix in row_indices.as_primitive::<UInt32Type>().values().iter() {
-                    indices[*row_ix as usize] = array_index;
-                }
-
-                self.state = ResultState::Partial {
-                    arrays: vec![row_values],
-                    indices,
-                };
-
-                Ok(())
-            }
-            ResultState::Partial { arrays, indices } => {
-                let array_index = PartialResultIndex::try_new(arrays.len())?;
-
-                arrays.push(row_values);
-
-                for row_ix in row_indices.as_primitive::<UInt32Type>().values().iter() {
-                    // This is check is only active for debug config because the callers of this method,
-                    // `case_when_with_expr` and `case_when_no_expr`, already ensure that
-                    // they only calculate a value for each row at most once.
-                    #[cfg(debug_assertions)]
-                    assert_or_internal_err!(
-                        indices[*row_ix as usize].is_none(),
-                        "Duplicate value for row {}",
-                        *row_ix
-                    );
-
-                    indices[*row_ix as usize] = array_index;
-                }
-                Ok(())
-            }
-            ResultState::Complete(_) => internal_err!(
+            ResultState::Partial { arrays, indices } => Ok((arrays, indices)),
+            _ => internal_err!(
                 "Cannot add a partial result when complete result is already set"
             ),
         }
@@ -624,7 +673,10 @@ impl ResultBuilder {
     }
 
     /// Finishes building the result and returns the final array.
-    fn finish(self) -> Result<ColumnarValue> {
+    fn finish(mut self) -> Result<ColumnarValue> {
+        if let Some(values) = self.dictionary_values.take() {
+            return self.finish_dictionary(values);
+        }
         match self.state {
             ResultState::Empty => {
                 // No complete result and no partial results.
@@ -642,6 +694,33 @@ impl ResultBuilder {
             ResultState::Complete(v) => {
                 // If we have a complete result, we can just return it.
                 Ok(v)
+            }
+        }
+    }
+
+    /// The dictionary counterpart of [Self::finish]: the row-to-branch mapping
+    /// is the key buffer and the prebuilt `values` are shared by every batch.
+    fn finish_dictionary(self, values: ArrayRef) -> Result<ColumnarValue> {
+        let wrap = |value: ScalarValue| {
+            ColumnarValue::Scalar(ScalarValue::Dictionary(
+                Box::new(DataType::UInt32),
+                Box::new(value),
+            ))
+        };
+        match self.state {
+            ResultState::Empty => Ok(wrap(ScalarValue::try_new_null(&self.data_type)?)),
+            ResultState::Complete(ColumnarValue::Scalar(s)) => Ok(wrap(s)),
+            ResultState::Complete(ColumnarValue::Array(_)) => {
+                internal_err!("dictionary CASE output requires scalar branches")
+            }
+            ResultState::Partial { arrays: _, indices } => {
+                let keys: PrimitiveArray<UInt32Type> = indices
+                    .iter()
+                    .map(|index| index.index().map(|i| i as u32))
+                    .collect();
+                Ok(ColumnarValue::Array(Arc::new(DictionaryArray::try_new(
+                    keys, values,
+                )?)))
             }
         }
     }
@@ -676,7 +755,71 @@ impl CaseExpr {
 
         let eval_method = Self::find_best_eval_method(&body)?;
 
-        Ok(Self { body, eval_method })
+        Ok(Self {
+            body,
+            eval_method,
+            dictionary_values: None,
+        })
+    }
+
+    /// Emit the result as `Dictionary(UInt32, T)` instead of a flat `T`: the
+    /// branch literals become the values, built once and shared by every
+    /// batch, and the per-row branch choice the keys. Only forms whose THEN
+    /// and ELSE branches are all literals can do this; other shapes return an
+    /// error so an opting-in caller learns immediately.
+    pub fn try_with_dictionary_output(mut self) -> Result<Self> {
+        let literal = |e: &Arc<dyn PhysicalExpr>| e.is::<Literal>();
+        let values = match &self.eval_method {
+            // The lookup table has already built the branch literals.
+            EvalMethod::WithExprScalarLookupTable(table) => {
+                Some(Arc::clone(table.values()))
+            }
+            EvalMethod::ScalarOrScalar => Some(self.prebuilt_dictionary_values()?),
+            EvalMethod::NoExpression(_) | EvalMethod::WithExpression(_)
+                if self
+                    .body
+                    .when_then_expr
+                    .iter()
+                    .all(|(_, then)| literal(then))
+                    && self.body.else_expr.as_ref().is_none_or(literal) =>
+            {
+                Some(self.prebuilt_dictionary_values()?)
+            }
+            _ => None,
+        };
+        let Some(values) = values else {
+            return plan_err!(
+                "dictionary output requires a CASE whose THEN and ELSE branches are all literals"
+            );
+        };
+        if matches!(values.data_type(), DataType::Dictionary(_, _)) {
+            return plan_err!(
+                "dictionary output over dictionary-typed branches is not supported"
+            );
+        }
+        self.dictionary_values = Some(values);
+        Ok(self)
+    }
+
+    /// Builds the values array for dictionary output: slot `n` holds branch
+    /// `n`'s literal, the ELSE literal one past the last WHEN. Branches are
+    /// literals, so the value type does not depend on the input schema.
+    fn prebuilt_dictionary_values(&self) -> Result<ArrayRef> {
+        let value_type = self.body.data_type(&Schema::empty())?;
+        let literal_value = |e: &Arc<dyn PhysicalExpr>| -> Result<ScalarValue> {
+            let Some(literal) = e.downcast_ref::<Literal>() else {
+                return internal_err!("dictionary CASE output requires literal branches");
+            };
+            literal.value().cast_to(&value_type)
+        };
+        let mut slots = Vec::with_capacity(self.body.when_then_expr.len() + 1);
+        for (_, then) in &self.body.when_then_expr {
+            slots.push(literal_value(then)?);
+        }
+        if let Some(e) = &self.body.else_expr {
+            slots.push(literal_value(e)?);
+        }
+        ScalarValue::iter_to_array(slots)
     }
 
     fn find_best_eval_method(body: &CaseBody) -> Result<EvalMethod> {
@@ -750,8 +893,12 @@ impl CaseBody {
         &self,
         batch: &RecordBatch,
         return_type: &DataType,
+        dictionary_values: Option<ArrayRef>,
     ) -> Result<ColumnarValue> {
-        let mut result_builder = ResultBuilder::new(return_type, batch.num_rows());
+        // The ELSE branch's value slot, one past the last WHEN.
+        let else_index = self.when_then_expr.len();
+        let mut result_builder =
+            ResultBuilder::new(return_type, batch.num_rows(), dictionary_values);
 
         // `remainder_rows` contains the indices of the rows that need to be evaluated
         let mut remainder_rows: ArrayRef =
@@ -787,7 +934,11 @@ impl CaseBody {
                 if base_all_null {
                     // All base values were null, so no need to filter
                     let nulls_value = expr.evaluate(&remainder_batch)?;
-                    result_builder.add_branch_result(&remainder_rows, nulls_value)?;
+                    result_builder.add_branch_result(
+                        &remainder_rows,
+                        nulls_value,
+                        else_index,
+                    )?;
                 } else {
                     // Filter out the null rows and evaluate the else expression for those
                     let nulls_filter = create_filter(&not(&base_not_nulls)?, true);
@@ -795,7 +946,11 @@ impl CaseBody {
                         filter_record_batch(&remainder_batch, &nulls_filter)?;
                     let nulls_rows = filter_array(&remainder_rows, &nulls_filter)?;
                     let nulls_value = expr.evaluate(&nulls_batch)?;
-                    result_builder.add_branch_result(&nulls_rows, nulls_value)?;
+                    result_builder.add_branch_result(
+                        &nulls_rows,
+                        nulls_value,
+                        else_index,
+                    )?;
                 }
             }
 
@@ -840,7 +995,7 @@ impl CaseBody {
             if when_value.null_count() == 0 && !when_value.has_false() {
                 let then_expression = &self.when_then_expr[i].1;
                 let then_value = then_expression.evaluate(&remainder_batch)?;
-                result_builder.add_branch_result(&remainder_rows, then_value)?;
+                result_builder.add_branch_result(&remainder_rows, then_value, i)?;
                 return result_builder.finish();
             }
 
@@ -855,7 +1010,7 @@ impl CaseBody {
 
             let then_expression = &self.when_then_expr[i].1;
             let then_value = then_expression.evaluate(&then_batch)?;
-            result_builder.add_branch_result(&then_rows, then_value)?;
+            result_builder.add_branch_result(&then_rows, then_value, i)?;
 
             // If this is the last 'when' branch and there is no 'else' expression, there's no
             // point in calculating the remaining rows.
@@ -885,7 +1040,7 @@ impl CaseBody {
             // keep `else_expr`'s data type and return type consistent
             let expr = try_cast(Arc::clone(e), &batch.schema(), return_type.clone())?;
             let else_value = expr.evaluate(&remainder_batch)?;
-            result_builder.add_branch_result(&remainder_rows, else_value)?;
+            result_builder.add_branch_result(&remainder_rows, else_value, else_index)?;
         }
 
         result_builder.finish()
@@ -896,8 +1051,12 @@ impl CaseBody {
         &self,
         batch: &RecordBatch,
         return_type: &DataType,
+        dictionary_values: Option<ArrayRef>,
     ) -> Result<ColumnarValue> {
-        let mut result_builder = ResultBuilder::new(return_type, batch.num_rows());
+        // The ELSE branch's value slot, one past the last WHEN.
+        let else_index = self.when_then_expr.len();
+        let mut result_builder =
+            ResultBuilder::new(return_type, batch.num_rows(), dictionary_values);
 
         // `remainder_rows` contains the indices of the rows that need to be evaluated
         let mut remainder_rows: ArrayRef =
@@ -927,7 +1086,7 @@ impl CaseBody {
             if when_value.null_count() == 0 && !when_value.has_false() {
                 let then_expression = &self.when_then_expr[i].1;
                 let then_value = then_expression.evaluate(&remainder_batch)?;
-                result_builder.add_branch_result(&remainder_rows, then_value)?;
+                result_builder.add_branch_result(&remainder_rows, then_value, i)?;
                 return result_builder.finish();
             }
 
@@ -942,7 +1101,7 @@ impl CaseBody {
 
             let then_expression = &self.when_then_expr[i].1;
             let then_value = then_expression.evaluate(&then_batch)?;
-            result_builder.add_branch_result(&then_rows, then_value)?;
+            result_builder.add_branch_result(&then_rows, then_value, i)?;
 
             // If this is the last 'when' branch and there is no 'else' expression, there's no
             // point in calculating the remaining rows.
@@ -971,7 +1130,7 @@ impl CaseBody {
             // keep `else_expr`'s data type and return type consistent
             let expr = try_cast(Arc::clone(e), &batch.schema(), return_type.clone())?;
             let else_value = expr.evaluate(&remainder_batch)?;
-            result_builder.add_branch_result(&remainder_rows, else_value)?;
+            result_builder.add_branch_result(&remainder_rows, else_value, else_index)?;
         }
 
         result_builder.finish()
@@ -1048,7 +1207,9 @@ impl CaseExpr {
         batch: &RecordBatch,
         projected: &ProjectedCaseBody,
     ) -> Result<ColumnarValue> {
-        let return_type = self.data_type(&batch.schema())?;
+        // The builder works over the value type; in dictionary mode the
+        // wrapper is added by the builder itself.
+        let return_type = self.body.data_type(&batch.schema())?;
         // projected.projection may include indexes of lambda variables not available on this batch
         let projection = projected
             .projection
@@ -1058,11 +1219,17 @@ impl CaseExpr {
             .collect::<Vec<_>>();
         if projection.len() < batch.num_columns() {
             let projected_batch = batch.project(&projection)?;
-            projected
-                .body
-                .case_when_with_expr(&projected_batch, &return_type)
+            projected.body.case_when_with_expr(
+                &projected_batch,
+                &return_type,
+                self.dictionary_values.clone(),
+            )
         } else {
-            self.body.case_when_with_expr(batch, &return_type)
+            self.body.case_when_with_expr(
+                batch,
+                &return_type,
+                self.dictionary_values.clone(),
+            )
         }
     }
 
@@ -1078,7 +1245,9 @@ impl CaseExpr {
         batch: &RecordBatch,
         projected: &ProjectedCaseBody,
     ) -> Result<ColumnarValue> {
-        let return_type = self.data_type(&batch.schema())?;
+        // The builder works over the value type; in dictionary mode the
+        // wrapper is added by the builder itself.
+        let return_type = self.body.data_type(&batch.schema())?;
         // projected.projection may include indexes of lambda variables not available on this batch
         let projection = projected
             .projection
@@ -1088,11 +1257,17 @@ impl CaseExpr {
             .collect::<Vec<_>>();
         if projection.len() < batch.num_columns() {
             let projected_batch = batch.project(&projection)?;
-            projected
-                .body
-                .case_when_no_expr(&projected_batch, &return_type)
+            projected.body.case_when_no_expr(
+                &projected_batch,
+                &return_type,
+                self.dictionary_values.clone(),
+            )
         } else {
-            self.body.case_when_no_expr(batch, &return_type)
+            self.body.case_when_no_expr(
+                batch,
+                &return_type,
+                self.dictionary_values.clone(),
+            )
         }
     }
 
@@ -1144,8 +1319,6 @@ impl CaseExpr {
     }
 
     fn scalar_or_scalar(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
-        let return_type = self.data_type(&batch.schema())?;
-
         // evaluate when expression
         let when_value = self.body.when_then_expr[0].0.evaluate(batch)?;
         let when_value = when_value.into_array(batch.num_rows())?;
@@ -1159,6 +1332,21 @@ impl CaseExpr {
             _ => Cow::Owned(prep_null_mask_filter(when_value)),
         };
 
+        // Dictionary output: the mask becomes the keys over the prebuilt
+        // values, where slot 0 is the THEN literal and slot 1 the ELSE.
+        if let Some(values) = &self.dictionary_values {
+            let keys = UInt32Array::from_iter_values(
+                when_value
+                    .values()
+                    .iter()
+                    .map(|matched| u32::from(!matched)),
+            );
+            return Ok(ColumnarValue::Array(Arc::new(DictionaryArray::try_new(
+                keys,
+                Arc::clone(values),
+            )?)));
+        }
+
         // evaluate then_value
         let then_value = self.body.when_then_expr[0].1.evaluate(batch)?;
         let then_value = Scalar::new(then_value.into_array(1)?);
@@ -1167,6 +1355,7 @@ impl CaseExpr {
             return internal_err!("expression did not evaluate to an array");
         };
         // keep `else_expr`'s data type and return type consistent
+        let return_type = self.data_type(&batch.schema())?;
         let expr = try_cast(Arc::clone(e), &batch.schema(), return_type)?;
         let else_ = Scalar::new(expr.evaluate(batch)?.into_array(1)?);
         Ok(ColumnarValue::Array(zip(&when_value, &then_value, &else_)?))
@@ -1235,7 +1424,11 @@ impl CaseExpr {
         let is_scalar = matches!(evaluated_expression, ColumnarValue::Scalar(_));
         let evaluated_expression = evaluated_expression.to_array(1)?;
 
-        let values = lookup_table.map_keys_to_values(&evaluated_expression)?;
+        let values = if self.dictionary_values.is_some() {
+            lookup_table.map_keys_to_dictionary(&evaluated_expression)?
+        } else {
+            lookup_table.map_keys_to_values(&evaluated_expression)?
+        };
 
         let result = if is_scalar {
             ColumnarValue::Scalar(ScalarValue::try_from_array(values.as_ref(), 0)?)
@@ -1249,7 +1442,14 @@ impl CaseExpr {
 
 impl PhysicalExpr for CaseExpr {
     fn data_type(&self, input_schema: &Schema) -> Result<DataType> {
-        self.body.data_type(input_schema)
+        let data_type = self.body.data_type(input_schema)?;
+        if self.dictionary_values.is_some() {
+            return Ok(DataType::Dictionary(
+                Box::new(DataType::UInt32),
+                Box::new(data_type),
+            ));
+        }
+        Ok(data_type)
     }
 
     fn nullable(&self, input_schema: &Schema) -> Result<bool> {
@@ -1381,11 +1581,17 @@ impl PhysicalExpr for CaseExpr {
                     ),
                     (false, false) => (None, &children[0..children.len()], None),
                 };
-            Ok(Arc::new(CaseExpr::try_new(
+            let rebuilt = CaseExpr::try_new(
                 expr.cloned(),
                 when_then_expr.iter().cloned().tuples().collect(),
                 else_expr.cloned(),
-            )?))
+            )?;
+            let rebuilt = if self.dictionary_values.is_some() {
+                rebuilt.try_with_dictionary_output()?
+            } else {
+                rebuilt
+            };
+            Ok(Arc::new(rebuilt))
         }
     }
 
@@ -1418,6 +1624,13 @@ impl PhysicalExpr for CaseExpr {
         ctx: &datafusion_physical_expr_common::physical_expr::proto_encode::PhysicalExprEncodeCtx<'_>,
     ) -> Result<Option<datafusion_proto_models::protobuf::PhysicalExprNode>> {
         use datafusion_proto_models::protobuf;
+
+        // The proto schema has no field for dictionary output yet; declining
+        // to serialize keeps the round-trip honest instead of silently
+        // rebuilding a flat CASE under a dictionary-typed schema.
+        if self.dictionary_values.is_some() {
+            return Ok(None);
+        }
 
         Ok(Some(protobuf::PhysicalExprNode {
             expr_id: None,
@@ -2175,6 +2388,426 @@ mod tests {
 
         // all result values should be null
         assert_eq!(result.logical_null_count(), batch.num_rows());
+        Ok(())
+    }
+
+    #[test]
+    fn dictionary_output_matches_the_flat_result() -> Result<()> {
+        let batch = case_test_batch()?;
+        let schema = batch.schema();
+
+        // CASE a WHEN 'foo' THEN 'fizz' WHEN 'bar' THEN 'buzz' ELSE 'other' END
+        let build = || {
+            CaseExpr::try_new(
+                Some(col("a", &schema).unwrap()),
+                vec![(lit("foo"), lit("fizz")), (lit("bar"), lit("buzz"))],
+                Some(lit("other")),
+            )
+        };
+        let flat = build()?;
+        let dictionary = build()?.try_with_dictionary_output()?;
+
+        assert_eq!(
+            dictionary.data_type(&schema)?,
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8))
+        );
+
+        let flat_out = flat.evaluate(&batch)?.into_array(batch.num_rows())?;
+        let dict_out = dictionary.evaluate(&batch)?.into_array(batch.num_rows())?;
+        assert_eq!(dict_out.data_type(), &dictionary.data_type(&schema)?);
+        // The declared type is honest: a batch can be built from the output.
+        let field = Field::new("c", dict_out.data_type().clone(), true);
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![field])),
+            vec![Arc::clone(&dict_out)],
+        )?;
+
+        let flattened = arrow::compute::cast(dict_out.as_ref(), &DataType::Utf8)?;
+        assert_eq!(flattened.as_ref(), flat_out.as_ref());
+        Ok(())
+    }
+
+    #[test]
+    fn dictionary_output_without_else_yields_nulls() -> Result<()> {
+        let batch = case_test_batch()?;
+        let schema = batch.schema();
+
+        let expr = CaseExpr::try_new(
+            Some(col("a", &schema)?),
+            vec![(lit("foo"), lit("fizz")), (lit("bar"), lit("buzz"))],
+            None,
+        )?
+        .try_with_dictionary_output()?;
+
+        let out = expr.evaluate(&batch)?.into_array(batch.num_rows())?;
+        let flattened = arrow::compute::cast(out.as_ref(), &DataType::Utf8)?;
+        let strings = flattened.as_string::<i32>();
+        // "baz" and NULL match nothing; the missing ELSE is a null slot.
+        assert_eq!(strings.value(0), "fizz");
+        assert!(strings.is_null(1));
+        assert!(strings.is_null(2));
+        assert_eq!(strings.value(3), "buzz");
+        Ok(())
+    }
+
+    #[test]
+    fn dictionary_output_over_a_scalar_base() -> Result<()> {
+        let batch = case_test_batch()?;
+
+        let expr = CaseExpr::try_new(
+            Some(lit("bar")),
+            vec![(lit("foo"), lit("fizz")), (lit("bar"), lit("buzz"))],
+            Some(lit("other")),
+        )?
+        .try_with_dictionary_output()?;
+
+        let out = expr.evaluate(&batch)?;
+        let ColumnarValue::Scalar(scalar) = out else {
+            panic!("expected a scalar");
+        };
+        assert_eq!(
+            scalar.data_type(),
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8))
+        );
+        let array = scalar.to_array_of_size(2)?;
+        let flattened = arrow::compute::cast(array.as_ref(), &DataType::Utf8)?;
+        assert_eq!(flattened.as_string::<i32>().value(0), "buzz");
+        Ok(())
+    }
+
+    #[test]
+    fn dictionary_output_declines_non_literal_branches() -> Result<()> {
+        let batch = case_test_batch()?;
+        let schema = batch.schema();
+
+        // CASE WHEN a = 'foo' THEN a ELSE 'y' END: the THEN branch is a
+        // column, so there is no static value set to build a dictionary from.
+        let when = binary(col("a", &schema)?, Operator::Eq, lit("foo"), &schema)?;
+        let result =
+            CaseExpr::try_new(None, vec![(when, col("a", &schema)?)], Some(lit("y")))?
+                .try_with_dictionary_output();
+        assert!(result.is_err());
+        let _ = batch;
+        Ok(())
+    }
+
+    #[test]
+    fn dictionary_output_survives_with_new_children() -> Result<()> {
+        let batch = case_test_batch()?;
+        let schema = batch.schema();
+
+        let expr: Arc<dyn PhysicalExpr> = Arc::new(
+            CaseExpr::try_new(
+                Some(col("a", &schema)?),
+                vec![(lit("foo"), lit("fizz")), (lit("bar"), lit("buzz"))],
+                Some(lit("other")),
+            )?
+            .try_with_dictionary_output()?,
+        );
+        let children = expr.children().into_iter().cloned().collect();
+        let rebuilt = Arc::clone(&expr).with_new_children(children)?;
+        assert_eq!(rebuilt.data_type(&schema)?, expr.data_type(&schema)?);
+        let _ = batch;
+        Ok(())
+    }
+
+    #[test]
+    fn dictionary_output_for_condition_case() -> Result<()> {
+        let batch = case_test_batch()?;
+        let schema = batch.schema();
+
+        // CASE WHEN a='foo' THEN 'fizz' WHEN a='bar' THEN 'buzz' ELSE 'other'
+        let build = || -> Result<CaseExpr> {
+            CaseExpr::try_new(
+                None,
+                vec![
+                    (
+                        binary(col("a", &schema)?, Operator::Eq, lit("foo"), &schema)?,
+                        lit("fizz"),
+                    ),
+                    (
+                        binary(col("a", &schema)?, Operator::Eq, lit("bar"), &schema)?,
+                        lit("buzz"),
+                    ),
+                ],
+                Some(lit("other")),
+            )
+        };
+        let flat = build()?;
+        let dictionary = build()?.try_with_dictionary_output()?;
+
+        let flat_out = flat.evaluate(&batch)?.into_array(batch.num_rows())?;
+        let dict_out = dictionary.evaluate(&batch)?.into_array(batch.num_rows())?;
+        assert_eq!(
+            dict_out.data_type(),
+            &DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8))
+        );
+        let flattened = arrow::compute::cast(dict_out.as_ref(), &DataType::Utf8)?;
+        assert_eq!(flattened.as_ref(), flat_out.as_ref());
+        Ok(())
+    }
+
+    #[test]
+    fn dictionary_output_keeps_conditions_lazy() -> Result<()> {
+        // The second condition divides by `d`, which is only safe because the
+        // first branch has already claimed the zero rows; dictionary output
+        // must keep that remainder-only evaluation.
+        let schema = Schema::new(vec![Field::new("d", DataType::Int32, false)]);
+        let d = Int32Array::from(vec![0, 5, 20]);
+        let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(d)])?;
+
+        let zero = binary(col("d", &schema)?, Operator::Eq, lit(0i32), &schema)?;
+        let ratio = binary(
+            binary(lit(100i32), Operator::Divide, col("d", &schema)?, &schema)?,
+            Operator::Gt,
+            lit(10i32),
+            &schema,
+        )?;
+        let expr = CaseExpr::try_new(
+            None,
+            vec![(zero, lit("zero")), (ratio, lit("big"))],
+            Some(lit("small")),
+        )?
+        .try_with_dictionary_output()?;
+
+        let out = expr.evaluate(&batch)?.into_array(batch.num_rows())?;
+        let flattened = arrow::compute::cast(out.as_ref(), &DataType::Utf8)?;
+        let strings = flattened.as_string::<i32>();
+        assert_eq!(strings.value(0), "zero");
+        assert_eq!(strings.value(1), "big");
+        assert_eq!(strings.value(2), "small");
+        Ok(())
+    }
+
+    #[test]
+    fn dictionary_output_when_one_branch_covers_all_rows() -> Result<()> {
+        let schema = Schema::new(vec![Field::new("a", DataType::Utf8, true)]);
+        let a = StringArray::from(vec![Some("foo"), Some("foo")]);
+        let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(a)])?;
+
+        let expr = CaseExpr::try_new(
+            None,
+            vec![
+                (
+                    binary(col("a", &schema)?, Operator::Eq, lit("foo"), &schema)?,
+                    lit("fizz"),
+                ),
+                (
+                    binary(col("a", &schema)?, Operator::Eq, lit("bar"), &schema)?,
+                    lit("buzz"),
+                ),
+            ],
+            Some(lit("other")),
+        )?
+        .try_with_dictionary_output()?;
+
+        let out = expr.evaluate(&batch)?;
+        let ColumnarValue::Scalar(scalar) = out else {
+            panic!("expected a scalar for a fully covered batch");
+        };
+        assert_eq!(
+            scalar.data_type(),
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dictionary_output_complete_batch_answers_from_the_prebuilt_slot() -> Result<()> {
+        // A hand-built expression may mix branch literal types; the full-
+        // coverage shortcut must still answer with the declared value type
+        // (the prebuilt slot's), not the raw branch scalar's.
+        let schema = Schema::new(vec![Field::new("a", DataType::Utf8, true)]);
+        let a = StringArray::from(vec![Some("bar"), Some("bar")]);
+        let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(a)])?;
+
+        let expr = CaseExpr::try_new(
+            None,
+            vec![
+                (
+                    binary(col("a", &schema)?, Operator::Eq, lit("foo"), &schema)?,
+                    lit(2i64),
+                ),
+                (
+                    binary(col("a", &schema)?, Operator::Eq, lit("bar"), &schema)?,
+                    lit(ScalarValue::Int32(Some(7))),
+                ),
+            ],
+            Some(lit(0i64)),
+        )?
+        .try_with_dictionary_output()?;
+
+        let ColumnarValue::Scalar(scalar) = expr.evaluate(&batch)? else {
+            panic!("expected a scalar for a fully covered batch");
+        };
+        assert_eq!(
+            scalar.data_type(),
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Int64))
+        );
+        let array = scalar.to_array_of_size(2)?;
+        let flattened = arrow::compute::cast(array.as_ref(), &DataType::Int64)?;
+        assert_eq!(
+            flattened
+                .as_primitive::<arrow::datatypes::Int64Type>()
+                .value(0),
+            7
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dictionary_output_declines_dictionary_typed_branches() -> Result<()> {
+        // Nested Dictionary(UInt32, Dictionary(..)) output is not something
+        // arrow kernels handle; the opt-in must refuse it up front.
+        let dict_literal = lit(ScalarValue::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(ScalarValue::from("x")),
+        ));
+        let schema = Schema::new(vec![Field::new("a", DataType::Utf8, true)]);
+        let when = binary(col("a", &schema)?, Operator::Eq, lit("foo"), &schema)?;
+        let result = CaseExpr::try_new(
+            None,
+            vec![(when, Arc::clone(&dict_literal))],
+            Some(dict_literal),
+        )?
+        .try_with_dictionary_output();
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn dictionary_output_null_keys_without_else() -> Result<()> {
+        let schema = Schema::new(vec![Field::new("a", DataType::Utf8, true)]);
+        let a = StringArray::from(vec![Some("foo"), Some("baz")]);
+        let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(a)])?;
+
+        let expr = CaseExpr::try_new(
+            None,
+            vec![
+                (
+                    binary(col("a", &schema)?, Operator::Eq, lit("foo"), &schema)?,
+                    lit("fizz"),
+                ),
+                (
+                    binary(col("a", &schema)?, Operator::Eq, lit("qqq"), &schema)?,
+                    lit("buzz"),
+                ),
+            ],
+            None,
+        )?
+        .try_with_dictionary_output()?;
+
+        let out = expr.evaluate(&batch)?.into_array(batch.num_rows())?;
+        let flattened = arrow::compute::cast(out.as_ref(), &DataType::Utf8)?;
+        let strings = flattened.as_string::<i32>();
+        assert_eq!(strings.value(0), "fizz");
+        assert!(strings.is_null(1));
+        Ok(())
+    }
+
+    #[test]
+    fn dictionary_output_for_scalar_or_scalar() -> Result<()> {
+        let batch = case_test_batch()?;
+        let schema = batch.schema();
+
+        // CASE WHEN a='foo' THEN 'yes' ELSE 'no' END; the NULL row's condition
+        // is NULL, which counts as false.
+        let build = || -> Result<CaseExpr> {
+            CaseExpr::try_new(
+                None,
+                vec![(
+                    binary(col("a", &schema)?, Operator::Eq, lit("foo"), &schema)?,
+                    lit("yes"),
+                )],
+                Some(lit("no")),
+            )
+        };
+        let flat = build()?;
+        let dictionary = build()?.try_with_dictionary_output()?;
+
+        let flat_out = flat.evaluate(&batch)?.into_array(batch.num_rows())?;
+        let dict_out = dictionary.evaluate(&batch)?.into_array(batch.num_rows())?;
+        assert_eq!(
+            dict_out.data_type(),
+            &DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8))
+        );
+        let flattened = arrow::compute::cast(dict_out.as_ref(), &DataType::Utf8)?;
+        assert_eq!(flattened.as_ref(), flat_out.as_ref());
+        Ok(())
+    }
+
+    #[test]
+    fn dictionary_output_reuses_one_values_buffer_across_batches() -> Result<()> {
+        // Downstream consumers recognize repeated values buffers by identity,
+        // so every batch must share the prebuilt branch literals instead of
+        // rebuilding them.
+        let schema = Schema::new(vec![Field::new("a", DataType::Utf8, true)]);
+        let make_batch = |rows: Vec<Option<&str>>| {
+            RecordBatch::try_new(
+                Arc::new(schema.clone()),
+                vec![Arc::new(StringArray::from(rows))],
+            )
+        };
+        let batch1 = make_batch(vec![Some("foo"), Some("bar"), Some("baz")])?;
+        let batch2 = make_batch(vec![Some("baz"), None, Some("foo")])?;
+
+        let when = |value: &str| -> Result<Arc<dyn PhysicalExpr>> {
+            binary(col("a", &schema)?, Operator::Eq, lit(value), &schema)
+        };
+        // One expression per supported path: lookup table, ResultBuilder,
+        // and ScalarOrScalar.
+        let lookup_case = CaseExpr::try_new(
+            Some(col("a", &schema)?),
+            vec![(lit("foo"), lit("fizz")), (lit("bar"), lit("buzz"))],
+            Some(lit("other")),
+        )?
+        .try_with_dictionary_output()?;
+        let condition_case = CaseExpr::try_new(
+            None,
+            vec![(when("foo")?, lit("fizz")), (when("bar")?, lit("buzz"))],
+            Some(lit("other")),
+        )?
+        .try_with_dictionary_output()?;
+        let if_case =
+            CaseExpr::try_new(None, vec![(when("foo")?, lit("yes"))], Some(lit("no")))?
+                .try_with_dictionary_output()?;
+
+        for expr in [lookup_case, condition_case, if_case] {
+            let values_of = |batch: &RecordBatch| -> Result<ArrayRef> {
+                let out = expr.evaluate(batch)?.into_array(batch.num_rows())?;
+                Ok(Arc::clone(out.as_dictionary::<UInt32Type>().values()))
+            };
+            let first = values_of(&batch1)?;
+            let second = values_of(&batch2)?;
+            assert!(
+                Arc::ptr_eq(&first, &second),
+                "values buffer must be shared across batches"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn dictionary_output_for_single_branch_base_expression() -> Result<()> {
+        let batch = case_test_batch()?;
+        let schema = batch.schema();
+
+        // CASE a WHEN 'foo' THEN 'fizz' ELSE 'other' END: one branch, so the
+        // lookup table declines and the general with-expression path runs.
+        let build = || -> Result<CaseExpr> {
+            CaseExpr::try_new(
+                Some(col("a", &schema)?),
+                vec![(lit("foo"), lit("fizz"))],
+                Some(lit("other")),
+            )
+        };
+        let flat = build()?;
+        let dictionary = build()?.try_with_dictionary_output()?;
+
+        let flat_out = flat.evaluate(&batch)?.into_array(batch.num_rows())?;
+        let dict_out = dictionary.evaluate(&batch)?.into_array(batch.num_rows())?;
+        let flattened = arrow::compute::cast(dict_out.as_ref(), &DataType::Utf8)?;
+        assert_eq!(flattened.as_ref(), flat_out.as_ref());
         Ok(())
     }
 
@@ -3417,6 +4050,17 @@ mod proto_tests {
         assert!(case_node.when_then_expr[0].when_expr.is_some());
         assert!(case_node.when_then_expr[0].then_expr.is_some());
         assert!(case_node.else_expr.is_some());
+    }
+
+    #[test]
+    fn try_to_proto_declines_dictionary_output() {
+        // No proto field carries the flag yet; a silent flat round-trip would
+        // desync the expression from its dictionary-typed schema.
+        let case = proto_case_fixture().try_with_dictionary_output().unwrap();
+        let encoder = StubEncoder::ok();
+        let ctx = PhysicalExprEncodeCtx::new(&encoder);
+
+        assert!(case.try_to_proto(&ctx).unwrap().is_none());
     }
 
     #[test]

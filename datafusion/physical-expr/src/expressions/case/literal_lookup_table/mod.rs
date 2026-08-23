@@ -29,6 +29,7 @@ use arrow::datatypes::DataType;
 use datafusion_common::{ScalarValue, arrow_datafusion_err, plan_datafusion_err};
 use indexmap::IndexMap;
 use std::fmt::Debug;
+use std::sync::Arc;
 
 /// Optimization for CASE expressions with literal WHEN and THEN clauses
 ///
@@ -213,6 +214,28 @@ impl LiteralLookupTable {
                 .map_err(|e| arrow_datafusion_err!(e))?;
 
         Ok(output)
+    }
+
+    /// The same mapping emitted as a dictionary: the indices become the keys
+    /// and the prebuilt literals the values, so the `take` above disappears.
+    /// A missing ELSE is already a null slot in `then_and_else_values`.
+    pub(in super::super) fn map_keys_to_dictionary(
+        &self,
+        keys_array: &ArrayRef,
+    ) -> datafusion_common::Result<ArrayRef> {
+        let keys = UInt32Array::from(
+            self.lookup
+                .map_to_when_indices(keys_array, self.else_index)?,
+        );
+        Ok(Arc::new(arrow::array::DictionaryArray::try_new(
+            keys,
+            Arc::clone(&self.then_and_else_values),
+        )?))
+    }
+
+    /// The prebuilt branch literals backing every batch of this expression.
+    pub(in super::super) fn values(&self) -> &ArrayRef {
+        &self.then_and_else_values
     }
 }
 
